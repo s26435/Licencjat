@@ -15,13 +15,15 @@ class SelfAttention(nn.Module):
         self.n_heads = n_heads
         self.d_head = d_embed // n_heads
 
-    def forward(self, x: torch.Tensor, casal_mask: bool = False) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, causal_mask: bool = False) -> torch.Tensor:
         """
         x: (batch size, seqence length, dim)
         """
 
         in_shape = x.shape
         b, seq_len, d_embd = in_shape
+        assert d_embd == self.n_heads * self.d_head
+
         i_shape = (b, seq_len, self.n_heads, self.d_head)
 
         # (batch size, seqence length, dim) ->  (batch size, seqence length, 3*dim) -> 3 * (batch size, seqence length, dim)
@@ -32,16 +34,14 @@ class SelfAttention(nn.Module):
         k = k.view(i_shape).transpose(1, 2)
         v = v.view(i_shape).transpose(1, 2)
 
-        weight = q @ k.transpose(-1, -2)
-
-        if casal_mask:
+        weight = q @ k.transpose(-1, -2) / math.sqrt(self.d_head)
+        if causal_mask:
             mask = torch.ones_like(weight, dtype=torch.bool).triu()
             weight.masked_fill_(mask, -torch.inf)
 
         # (batch size, n_heads, seqence length, seqence length) -> (batch size, n_heads, seqence length, dim/n_heads)
-        weight /= math.sqrt(self.d_head)
         weight = F.softmax(weight, dim=-1)
         output = weight @ v
 
         # (batch size, n_heads, seqence length, dim/n_heads) -> (batch size, seqence length, n_heads,  dim/n_heads)
-        return self.out_p(output).transpose(1, 2).reshape(in_shape)
+        return self.out_p(output.transpose(1, 2).reshape(in_shape))
