@@ -1,0 +1,2 @@
+# Praca licencjacka
+Jan Wolski
