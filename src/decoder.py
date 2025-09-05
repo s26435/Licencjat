@@ -40,11 +40,8 @@ class VAE_Attention_Block(nn.Module):
 
 
 class VAE_Residual_Block(nn.Module):
-    def __init__(
-        self, in_channels: int, out_channels: int
-    ):
+    def __init__(self, in_channels: int, out_channels: int):
         super(VAE_Residual_Block, self).__init__()
-
 
         self.groupnorm1 = nn.GroupNorm(safe_num_groups(in_channels, 32), in_channels)
         self.conv1 = nn.Conv3d(
@@ -84,11 +81,11 @@ class VAE_Residual_Block(nn.Module):
 class VAE_Decoder_Block(nn.Sequential):
     def __init__(self, in_channels: int, out_channels: int):
         super().__init__(
-                nn.Upsample(scale_factor=2),
-                nn.Conv3d(in_channels, in_channels, kernel_size=3, padding=1),
-                VAE_Residual_Block(in_channels, out_channels),
-                VAE_Residual_Block(out_channels, out_channels),
-                VAE_Residual_Block(out_channels, out_channels),
+            nn.Upsample(scale_factor=2),
+            nn.Conv3d(in_channels, in_channels, kernel_size=3, padding=1),
+            VAE_Residual_Block(in_channels, out_channels),
+            VAE_Residual_Block(out_channels, out_channels),
+            VAE_Residual_Block(out_channels, out_channels),
         )
 
 
@@ -98,7 +95,7 @@ class VAE_Decoder(nn.Module):
         latent_size: int = 4,
         out_channels: int = 3,
         cov_layer_channels: list[int] = [512, 256, 128],
-        scale_const = 0.18215
+        scale_const=0.18215,
     ):
         super(VAE_Decoder, self).__init__()
 
@@ -111,7 +108,7 @@ class VAE_Decoder(nn.Module):
             VAE_Residual_Block(cov_layer_channels[0], cov_layer_channels[0]),
             VAE_Residual_Block(cov_layer_channels[0], cov_layer_channels[0]),
             VAE_Residual_Block(cov_layer_channels[0], cov_layer_channels[0]),
-            VAE_Decoder_Block(cov_layer_channels[0], cov_layer_channels[0])
+            VAE_Decoder_Block(cov_layer_channels[0], cov_layer_channels[0]),
         ]
 
         layers.extend(
