@@ -49,11 +49,7 @@ class CLIPLayer(nn.Module):
         x += residue
         residue = x
         x = self.layernorm2(x)
-        x = self.dense1(x)
-        x = self.dense2(x)
-        x = self.qgelu(x)
-        x += residue
-        return x
+        return  self.dense2(self.qgelu(self.dense1(x))) + residue
 
 
 class CLIP(nn.Module):

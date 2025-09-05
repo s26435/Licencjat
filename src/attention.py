@@ -20,7 +20,7 @@ class SelfAttention(nn.Module):
         x:      (batch size, seqence length, dim)
         return: (batch size, seqence length, n_heads,  dim/n_heads)
         """
-
+        B, L, D = x.shape
         in_shape = x.shape
         b, seq_len, d_embd = in_shape
         assert d_embd == self.n_heads * self.d_head
@@ -35,13 +35,16 @@ class SelfAttention(nn.Module):
         k = k.view(i_shape).transpose(1, 2)
         v = v.view(i_shape).transpose(1, 2)
 
-        weight = q @ k.transpose(-1, -2) / math.sqrt(self.d_head)
-        if causal_mask:
-            mask = torch.ones_like(weight, dtype=torch.bool).triu()
-            weight.masked_fill_(mask, -torch.inf)
+        scores = q @ k.transpose(-1, -2) / math.sqrt(self.d_head)
 
+        if causal_mask:
+            causal = torch.ones(L, L, device=x.device, dtype=torch.bool).triu(diagonal=1)
+            scores = scores.masked_fill(causal[None, None, :, :], -1e9)
+
+
+        scores = scores - scores.amax(dim=-1, keepdim=True)
         # (batch size, n_heads, seqence length, seqence length) -> (batch size, n_heads, seqence length, dim/n_heads)
-        weight = F.softmax(weight, dim=-1)
+        weight = F.softmax(scores, dim=-1)
         output = weight @ v
 
         # (batch size, n_heads, seqence length, dim/n_heads) -> (batch size, seqence length, n_heads,  dim/n_heads)

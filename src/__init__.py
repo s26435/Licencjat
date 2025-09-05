@@ -14,6 +14,9 @@ from .utils import (
     count_params,
     guess_dtype,
     human_bytes,
+    Dummy3DDataset,
+    VolumetricDataModule,
+    models_summary,
 )
 from .clip import CLIPEmbedding, CLIPLayer, CLIP
 from .diffusion import (
@@ -26,7 +29,11 @@ from .diffusion import (
     UNET_Upsample,
     Diffusion,
 )
-
+from .ddpm import timestep_embedding, DDPMSampler
+from .stable_diffusion import DiffusionSystem
+from .configs import LitConfig, VAEConfig
+from .training import train_new_diffusion, train_new_vae
+from .vae import VAESystem
 
 __all__ = [
     "SelfAttention",
@@ -54,4 +61,16 @@ __all__ = [
     "count_params",
     "guess_dtype",
     "human_bytes",
+    "Dummy3DDataset",
+    "VolumetricDataModule",
+    "timestep_embedding",
+    "DDPMSampler",
+    "DiffusionSystem",
+    "train_new",
+    "models_summary",
+    "LitConfig",
+    "VAEConfig",
+    "train_new_diffusion",
+    "VAESystem",
+    "train_new_vae",
 ]
