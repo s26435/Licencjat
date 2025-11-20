@@ -166,13 +166,22 @@ class UNET_Upsample(nn.Module):
 
 
 class UNET(nn.Module):
+    @staticmethod
+    def _resize_like(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+        if x.shape[2:] == ref.shape[2:]:
+            return x
+        return F.interpolate(x, size=ref.shape[2:], mode="nearest")
+
     def __init__(
         self, context_dim: int, latent_size: int, T: int, H: int = 8, A: int = 40
     ):
         super(UNET, self).__init__()
-        T = T
-        H = H
-        A = A
+        self.context_dim = context_dim
+        self.T = T
+        self.H = H
+        self.A = A
+
+        # ---- encoder jak miałeś ----
         self.encoder = nn.ModuleList(
             [
                 SwitchSequential(nn.Conv3d(latent_size, T, kernel_size=3, padding=1)),
@@ -184,133 +193,180 @@ class UNET(nn.Module):
                     UNET_Residual_Block(T, T, T),
                     UNET_Attention_Block(H, A, context_dim),
                 ),
-                SwitchSequential(nn.Conv3d(T, T, kernel_size=3, stride=2, padding=1)),
                 SwitchSequential(
-                    UNET_Residual_Block(T, T * 2, T),
-                    UNET_Attention_Block(H, A * 2, context_dim),
+                    nn.Conv3d(T, T, kernel_size=(1, 2, 2), stride=(1, 2, 2), padding=0)
                 ),
                 SwitchSequential(
-                    UNET_Residual_Block(T * 2, T * 2, T),
-                    UNET_Attention_Block(H, A * 2, context_dim),
+                    UNET_Residual_Block(T, 2 * T, T),
+                    UNET_Attention_Block(H, 2 * A, context_dim),
                 ),
                 SwitchSequential(
-                    nn.Conv3d(T * 2, T * 2, kernel_size=3, stride=2, padding=1)
+                    UNET_Residual_Block(2 * T, 2 * T, T),
+                    UNET_Attention_Block(H, 2 * A, context_dim),
                 ),
                 SwitchSequential(
-                    UNET_Residual_Block(T * 2, T * 4, T),
-                    UNET_Attention_Block(H, A * 4, context_dim),
+                    nn.Conv3d(
+                        2 * T, 2 * T, kernel_size=(1, 2, 2), stride=(1, 2, 2), padding=0
+                    )
                 ),
                 SwitchSequential(
-                    UNET_Residual_Block(T * 4, T * 4, T),
-                    UNET_Attention_Block(H, A * 4, context_dim),
+                    UNET_Residual_Block(2 * T, 2 * T, T),
+                    UNET_Attention_Block(H, 2 * A, context_dim),
                 ),
                 SwitchSequential(
-                    UNET_Residual_Block(T * 4, T * 4, T),
-                    UNET_Attention_Block(H, A * 4, context_dim),
+                    UNET_Residual_Block(2 * T, 2 * T, T),
+                    UNET_Attention_Block(H, 2 * A, context_dim),
                 ),
-                SwitchSequential(
-                    nn.Conv3d(T * 4, T * 4, kernel_size=3, stride=2, padding=1)
-                ),
-                SwitchSequential(UNET_Residual_Block(T * 4, T * 4, T)),
-                SwitchSequential(UNET_Residual_Block(T * 4, T * 4, T)),
             ]
         )
 
         self.bottle_neck = SwitchSequential(
-            UNET_Residual_Block(T * 4, T * 4, T),
-            UNET_Attention_Block(H, A * 4, context_dim),
-            UNET_Residual_Block(T * 4, T * 4, T),
+            UNET_Residual_Block(2 * T, 2 * T, T),
+            UNET_Attention_Block(H, 2 * A, context_dim),
+            UNET_Residual_Block(2 * T, 2 * T, T),
         )
 
+        # ---- decoder jak u Ciebie ----
         self.decoder = nn.ModuleList(
             [
                 SwitchSequential(
-                    UNET_Residual_Block(4 * T + 4 * T, 4 * T, T),
-                    UNET_Attention_Block(H, 4 * A, context_dim),
+                    UNET_Residual_Block(4 * T, 2 * T, T),
+                    UNET_Attention_Block(H, 2 * A, context_dim),
                 ),
                 SwitchSequential(
-                    UNET_Residual_Block(4 * T + 4 * T, 4 * T, T),
-                    UNET_Attention_Block(H, 4 * A, context_dim),
-                ),
-                SwitchSequential(
-                    UNET_Residual_Block(4 * T + 4 * T, 4 * T, T),
-                    UNET_Attention_Block(H, 4 * A, context_dim),
-                    UNET_Upsample(4 * T),
-                ),
-                SwitchSequential(
-                    UNET_Residual_Block(4 * T + 4 * T, 4 * T, T),
-                    UNET_Attention_Block(H, 4 * A, context_dim),
-                ),
-                SwitchSequential(
-                    UNET_Residual_Block(4 * T + 4 * T, 4 * T, T),
-                    UNET_Attention_Block(H, 4 * A, context_dim),
-                ),
-                SwitchSequential(
-                    UNET_Residual_Block(4 * T + 4 * T, 4 * T, T),
-                    UNET_Attention_Block(H, 4 * A, context_dim),
-                ),
-                SwitchSequential(
-                    UNET_Residual_Block(4 * T + 2 * T, 2 * T, T),
+                    UNET_Residual_Block(4 * T, 2 * T, T),
                     UNET_Attention_Block(H, 2 * A, context_dim),
                     UNET_Upsample(2 * T),
                 ),
+
                 SwitchSequential(
-                    UNET_Residual_Block(2 * T + 2 * T, 2 * T, T),
-                    UNET_Attention_Block(H, 2 * A, context_dim),
-                ),
-                SwitchSequential(
-                    UNET_Residual_Block(2 * T + 2 * T, 2 * T, T),
-                    UNET_Attention_Block(H, 2 * A, context_dim),
-                ),
-                SwitchSequential(
-                    UNET_Residual_Block(2 * T + T, T, T), UNET_Upsample(T)
-                ),
-                SwitchSequential(
-                    UNET_Residual_Block(T + T, T, T),
+                    UNET_Residual_Block(4 * T, T, T),
                     UNET_Attention_Block(H, A, context_dim),
                 ),
                 SwitchSequential(
-                    UNET_Residual_Block(T + T, T, T),
+                    UNET_Residual_Block(3 * T, T, T),
+                    UNET_Attention_Block(H, A, context_dim),
+                    UNET_Upsample(T),
+                ),
+
+                SwitchSequential(
+                    UNET_Residual_Block(2 * T, T, T),
                     UNET_Attention_Block(H, A, context_dim),
                 ),
                 SwitchSequential(
-                    UNET_Residual_Block(T + T, T, T),
+                    UNET_Residual_Block(2 * T, T, T),
                     UNET_Attention_Block(H, A, context_dim),
                 ),
             ]
         )
 
-    def forward(self, x, context, time):
-        skip_connections = []
-        for layers in self.encoder:
-            x = layers(x, context, time)
-            skip_connections.append(x)
+        # ---- dodatkowe projekcje X -> sekwencja o wymiarze 2*T ----
+        self.proj_low  = nn.Conv3d(2 * T, 2 * T, kernel_size=1)  # po pierwszym upsamplu
+        self.proj_mid  = nn.Conv3d(T,     2 * T, kernel_size=1)  # po drugim upsamplu
+        self.proj_top  = nn.Conv3d(T,     2 * T, kernel_size=1)  # finalna skala (opcjonalnie)
+
+        # ---- HEAD Y: atencja z kontekstem i z X podczas upsamplowania ----
+        self.bottom_enocoder = nn.ModuleList(
+            [
+                # start z feature map po bottlenecku: (B, 2*T, D', H', W')
+                nn.Conv3d(2 * T, 2 * T, kernel_size=1, stride=1, padding=0),
+                nn.Conv3d(2 * T, 2 * T, kernel_size=1, stride=1, padding=0),
+
+                # Y <-> context (tekst)
+                CrossAttention(H, 2 * T, context_dim),
+
+                # Y <-> X_low
+                CrossAttention(H, 2 * T, 2 * T),
+
+                # Y <-> X_mid
+                CrossAttention(H, 2 * T, 2 * T),
+
+                # Y <-> X_top
+                CrossAttention(H, 2 * T, 2 * T),
+
+                # na koniec wektor (B, 6)
+                nn.Linear(2 * T, 6),
+            ]
+        )
+
+    def _fmap_to_seq(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, C, D, H, W) -> (B, L, C)
+        """
+        B, C, D, H, W = x.shape
+        return x.view(B, C, D * H * W).transpose(1, 2)
+
+
+    def forward(self, x: torch.Tensor, context: torch.Tensor, time: torch.Tensor):
+        B, C, D, H_, W_ = x.shape
+
+        x = self.encoder[0](x, context, time)
+        x = self.encoder[1](x, context, time)
+        x = self.encoder[2](x, context, time)
+        skip_top = x
+
+        x = self.encoder[3](x, context, time)
+        x = self.encoder[4](x, context, time)
+        x = self.encoder[5](x, context, time)
+        skip_mid = x
+
+        x = self.encoder[6](x, context, time)
+        x = self.encoder[7](x, context, time)
+        x = self.encoder[8](x, context, time)
+        skip_low = x  
 
         x = self.bottle_neck(x, context, time)
 
-        for i, layers in enumerate(self.decoder):
-            # Zrzuć skipy z inną rozdzielczością niż bieżące x
-            while skip_connections and skip_connections[-1].shape[2:] != x.shape[2:]:
-                skip_connections.pop()
+        y = self.bottom_enocoder[0](x)
+        y = self.bottom_enocoder[1](y)
+        y = self._fmap_to_seq(y)
 
-            # Teraz powinniśmy mieć skip o tej samej rozdzielczości
-            if not skip_connections:
-                raise RuntimeError(
-                    f"Brak skipa o rozdzielczości {tuple(x.shape[2:])} dla decoder[{i}]. "
-                    f"Sprawdź gdzie dodajesz skipy w encoderze."
-                )
+        y = self.bottom_enocoder[2](y, context)
 
-            skip = skip_connections.pop()
-            # Dodatkowe zabezpieczenie
-            if skip.shape[2:] != x.shape[2:]:
-                raise RuntimeError(
-                    f"Niedopasowanie: x {tuple(x.shape)} vs skip {tuple(skip.shape)}"
-                )
+        x = self._resize_like(x, skip_low)
+        x = torch.cat([x, skip_low], dim=1)
+        x = self.decoder[0](x, context, time)
 
-            x = torch.cat((x, skip), dim=1)
-            x = layers(x, context, time)
+        x = self._resize_like(x, skip_low)
+        x = torch.cat([x, skip_low], dim=1)
+        x = self.decoder[1](x, context, time)  # zawiera Upsample -> wyższa H,W
 
-        return x
+        # Y patrzy na X po pierwszym upsamplu
+        x_low = self.proj_low(x)                # (B, 2*T, D1, H1, W1)
+        x_low_seq = self._fmap_to_seq(x_low)    # (B, L_low, 2*T)
+        y = self.bottom_enocoder[3](y, x_low_seq)
+
+        # skala "mid"
+        x = self._resize_like(x, skip_mid)
+        x = torch.cat([x, skip_mid], dim=1)     # (B, 4*T, ...)
+        x = self.decoder[2](x, context, time)   # (B, T, ...)
+
+        x = self._resize_like(x, skip_mid)
+        x = torch.cat([x, skip_mid], dim=1)     # (B, 3*T, ...)
+        x = self.decoder[3](x, context, time)   # Upsample
+
+        # Y patrzy na X po drugim upsamplu
+        x_mid = self.proj_mid(x)                # (B, 2*T, D2, H2, W2)
+        x_mid_seq = self._fmap_to_seq(x_mid)    # (B, L_mid, 2*T)
+        y = self.bottom_enocoder[4](y, x_mid_seq)
+
+        # skala "top"
+        x = self._resize_like(x, skip_top)
+        x = torch.cat([x, skip_top], dim=1)     # (B, 2*T, ...)
+        x = self.decoder[4](x, context, time)   # (B, T, ...)
+
+        x = self._resize_like(x, skip_top)
+        x = torch.cat([x, skip_top], dim=1)     # (B, 2*T, ...)
+        x = self.decoder[5](x, context, time)   # (B, T, D_out, H_out, W_out)
+
+        # Y patrzy na finalne X (opcjonalne, ale czemu nie)
+        x_top = self.proj_top(x)                # (B, 2*T, D3, H3, W3)
+        x_top_seq = self._fmap_to_seq(x_top)    # (B, L_top, 2*T)
+        y = self.bottom_enocoder[5](y, x_top_seq)
+
+        y = y.mean(dim=1)
+        y = self.bottom_enocoder[6](y) 
+        return x, y
 
 
 class Diffusion(nn.Module):
@@ -336,7 +392,5 @@ class Diffusion(nn.Module):
         """
         time = self.time_embedding(time)
 
-        #  -> (batch size, time_embeding_size, x/8, y/8, z/8)
-        output = self.unet(latent, context, time)
-        # (batch size, time_embeding_size, x/8, y/8, z/8) -> (batch size, latent size, x/8, y/8, z/8)
-        return self.final(output)
+        output, y = self.unet(latent, context, time)
+        return self.final(output), y

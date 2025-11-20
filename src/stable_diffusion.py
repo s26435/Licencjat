@@ -1,304 +1,381 @@
-from typing import Optional
-import os
-import math
+import pytorch_lightning as pl
+from pathlib import Path
+from typing import Tuple
 
 import torch
-from torch.nn import functional as F
-
-import pytorch_lightning as pl
-
-from .configs import LitConfig
-from .decoder import VAE_Decoder
-from .encoder import VAE_Encoder
-from .clip import CLIP
-from .diffusion import Diffusion
-from .ddpm import timestep_embedding, DDPMSampler
-
-try:
-    from torchvision.utils import save_image
-
-    _HAS_TV = True
-except Exception:
-    _HAS_TV = False
+import torch.nn as nn
+import torch.nn.functional as F
 
 
-class DiffusionSystem(pl.LightningModule):
-    def __init__(self, cfg: LitConfig):
+from src.modules.vae import VAE
+from src.modules.context import ContextEncoder
+from src.modules.configs import VAEConfig
+from src.modules.diffusion import Diffusion
+from src.modules.ddpm import DDPMSampler, timestep_embedding
+from typing import Any, Optional, Union
+
+def SD_loss(eps_pred: torch.Tensor, eps_true: torch.Tensor, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+    return F.mse_loss(eps_pred, eps_true) + F.mse_loss(y_pred, y_true)
+
+class StableDiffusion(pl.LightningModule):
+    def __init__(
+        self,
+        vae_path: str | Path,
+        time_dim: int = 320,
+        context_dim: int = 128,
+        lr: float = 1e-4,
+        weight_decay: float = 1e-4,
+        num_train_steps: int = 1000,
+        p_uncond: float = 0.1,
+        guidance_scale: float = 1.0,
+        ctx_encoder_kwargs: dict[str, Any] | None = None,
+    ):
         super().__init__()
-        self.save_hyperparameters(cfg.__dict__)
-        self.cfg = cfg
-        self.encoder = VAE_Encoder()
-        self.decoder = VAE_Decoder()
-        self.clip = CLIP() if cfg.use_clip else None
-        self.diffusion = Diffusion(context_dim=cfg.context_dim)
-
-        if self.clip and cfg.freeze_clip:
-            for p in self.clip.parameters():
-                p.requires_grad = False
-        if cfg.freeze_decoder:
-            for p in self.decoder.parameters():
-                p.requires_grad = False
-
-        self.register_buffer("betas", torch.empty(0), persistent=False)
-        self.register_buffer("alphas", torch.empty(0), persistent=False)
-        self.register_buffer("alphas_bar", torch.empty(0), persistent=False)
-        os.makedirs(self.cfg.outdir, exist_ok=True)
-        self.val_step_count = 0
-
-    def setup(self, stage: Optional[str] = None) -> None:
-        if self.cfg.beta_schedule == "sqrt_linear":
-            betas = (
-                torch.linspace(1e-4**0.5, 2e-2**0.5, self.cfg.T, dtype=torch.float32)
-                ** 2
-            )
-        elif self.cfg.beta_schedule == "linear":
-            betas = torch.linspace(1e-4, 2e-2, self.cfg.T, dtype=torch.float32)
-        elif self.cfg.beta_schedule == "cosine":
-            s = 0.008
-            steps = torch.arange(
-                self.cfg.T + 1, dtype=torch.float64, device=self.device
-            )
-            f = torch.cos(((steps / self.cfg.T + s) / (1 + s)) * math.pi / 2) ** 2
-            alphas_bar = f / f[0]
-            betas = (
-                (1 - (alphas_bar[1:] / alphas_bar[:-1]))
-                .clamp(1e-6, 0.9999)
-                .to(torch.float32)
-            )
-        else:
-            raise ValueError(self.cfg.beta_schedule)
-
-        betas = betas.to(self.device)
-        self.betas = betas
-        self.alphas = 1.0 - betas
-        self.alphas_bar = torch.cumprod(self.alphas, dim=0)
-        self._load_vae_weights()
-
-    def _encode_with_noise(self, x: torch.Tensor) -> torch.Tensor:
-        B, _, D, H, W = x.shape
-        zD, zH, zW = (
-            D // self.cfg.downscale,
-            H // self.cfg.downscale,
-            W // self.cfg.downscale,
-        )
-        noise_enc = torch.randn(
-            (B, self.cfg.latent_channels, zD, zH, zW),
-            device=x.device,
-            dtype=x.dtype,
+        self.save_hyperparameters(
+            {
+                "time_dim": time_dim,
+                "context_dim": context_dim,
+                "lr": lr,
+                "weight_decay": weight_decay,
+                "num_train_steps": num_train_steps,
+                "p_uncond": p_uncond,
+                "guidance_scale": guidance_scale,
+                "ctx_encoder_kwargs": ctx_encoder_kwargs or {},
+            }
         )
 
-        try:
-            out = self.encoder(x, noise_enc)
-        except TypeError:
-            out = self.encoder(x)
+        vae_cfg = VAEConfig()
+        self.vae = VAE(vae_cfg)
+        self.vae.load_vae_from_file(Path(vae_path))
+        for p in self.vae.parameters():
+            p.requires_grad = False
+        self.vae.eval()
+        self.ctx_enc = ContextEncoder(
+            in_dim=3,
+            out_dim=context_dim,
+            hidden=256,
+            dropout=0.0,
+        )
+        latent_ch = getattr(vae_cfg, "latent_channels", getattr(vae_cfg, "latent", 4))
+        self.model = Diffusion(
+            context_dim=context_dim,
+            time_embedding_size=time_dim,
+            latent_space_size=latent_ch,
+        )
+        self.null_context = nn.Parameter(torch.zeros(1, 1, context_dim))
 
-        if isinstance(out, tuple):
-            if len(out) == 3:
-                z, mu, logvar = out
-            elif len(out) == 2:
-                mu, logvar = out
-                z = mu + noise_enc * torch.exp(0.5 * logvar)
-            elif len(out) == 1:
-                z = out[0]
-            else:
-                z = out[0]
+        self.sampler = DDPMSampler(num_training_steps=num_train_steps)
+
+    @staticmethod
+    def _pick_x_from_batch(batch):
+        if isinstance(batch, dict):
+            for k in ("x", "image", "images"):
+                if k in batch:
+                    return batch[k]
+            return next(iter(batch.values()))
+        if isinstance(batch, (list, tuple)):
+            return batch[0]
+        return batch
+
+    @staticmethod
+    def _pick_context_from_batch(batch):
+        if isinstance(batch, dict):
+            for k in ("context", "cond", "ctx"):
+                if k in batch:
+                    return batch[k]
+        if isinstance(batch, (list, tuple)) and len(batch) > 1:
+            return batch[1]
+        return None
+
+    @torch.no_grad()
+    def _encode_to_latents(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.vae.encoder(x)
+        if isinstance(out, (tuple, list)) and len(out) >= 1:
+            z = out[0]
         else:
             z = out
-
         return z
 
-    def _check_finite(self, name: str, t: torch.Tensor):
-        if not torch.isfinite(t).all():
-            with torch.no_grad():
-                m = t.float()
-                print(
-                    f"[NaNGuard] {name}: "
-                    f"shape={tuple(m.shape)} min={m.min().item():.3e} max={m.max().item():.3e} "
-                    f"mean={m.mean().item():.3e} std={m.std().item():.3e}"
+    def _encode_context(
+        self,
+        ctx_raw: torch.Tensor | None,
+        batch_size: int | None = 1,
+    ) -> torch.Tensor:
+        if ctx_raw is None:
+            if batch_size is None:
+                raise ValueError(
+                    "Dla ctx_raw=None musisz podać batch_size do _encode_context."
                 )
-            raise RuntimeError(f"Detected non-finite values in {name}")
+            return self.null_context.expand(batch_size, 1, self.hparams.context_dim)
 
-    def _forward_loss(self, x: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
-        B = x.size(0)
+        ctx_raw = ctx_raw.to(self.device)
+        ctx_emb = self.ctx_enc(ctx_raw)
+        return ctx_emb
 
-        # encode
-        z0 = self._encode_with_noise(x) * self.cfg.latent_scale
+    def _maybe_drop_context(
+        self, ctx_emb: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        b = ctx_emb.size(0)
+        if self.hparams.p_uncond <= 0:
+            return ctx_emb, torch.zeros(b, dtype=torch.bool, device=ctx_emb.device)
+        drop = torch.rand(b, device=ctx_emb.device) < self.hparams.p_uncond
+        if drop.any():
+            null = self.null_context.expand(b, 1, self.hparams.context_dim)
+            ctx_emb = torch.where(drop.view(b, 1, 1), null, ctx_emb)
+        return ctx_emb, drop
 
-        # noise
-        t = torch.randint(0, self.cfg.T, (B,), device=self.device, dtype=torch.long)
-        eps = torch.randn_like(z0)
-        a_bar_t = self.alphas_bar[t].view(B, 1, 1, 1, 1)
-        zt = torch.sqrt(a_bar_t) * z0 + torch.sqrt(1 - a_bar_t) * eps
+    def training_step(self, batch, batch_idx: int):
+        x = self._pick_x_from_batch(batch).to(self.device)
+        ctx_raw = self._pick_context_from_batch(batch)
 
-        # context
-        if self.cfg.use_clip:
-            context = self.clip(tokens)  # (B,77,context_dim)
-            assert context.size(-1) == self.cfg.context_dim, (
-                f"CLIP zwrócił dim={context.size(-1)}, oczekiwano {self.cfg.context_dim}"
-            )
-        else:
-            context = torch.zeros(B, 1, self.cfg.context_dim, device=self.device)
+        if "cell_params" not in batch:
+            raise RuntimeError("Batch nie zawiera 'cell_params', nie mam targetu dla y.")
+        cell = batch["cell_params"].to(self.device)
 
-        self._check_finite("context", context)
+        with torch.no_grad():
+            z = self._encode_to_latents(x)
 
-        t_vec = timestep_embedding(t, self.cfg.time_dim)
-        self._check_finite("t_vec", t_vec)
+        b = z.size(0)
+        t = torch.randint(0, self.sampler.T, (b,), device=self.device, dtype=torch.long)
+        eps = torch.randn_like(z)
 
-        eps_hat = self.diffusion(zt, context, t_vec)
-        self._check_finite("eps_hat", eps_hat)
+        alpha_bar = self.sampler.alphas_bar.to(self.device)[t].view(
+            b, *([1] * (z.dim() - 1))
+        )
+        z_noisy = torch.sqrt(alpha_bar) * z + torch.sqrt(1.0 - alpha_bar) * eps
 
-        loss = F.mse_loss(eps_hat, eps)
-        self._check_finite("loss", loss)
+        ctx_emb = self._encode_context(ctx_raw)
+        ctx_emb, drop_mask = self._maybe_drop_context(ctx_emb)
 
-        return F.mse_loss(eps_hat, eps)
+        t_emb = timestep_embedding(t, self.hparams.time_dim).to(self.device)
+        eps_pred, y = self.model(z_noisy, ctx_emb, t_emb)
 
-    # ---- Lightning hooks ----
-    def training_step(self, batch, batch_idx):
-        x, tokens = batch
-        loss = self._forward_loss(x, tokens)
-        self.log(
-            "train/loss",
-            loss,
+        loss = SD_loss(eps_pred, eps, y, cell)
+
+        self.log_dict(
+            {
+                "train/loss": loss,
+                "train/uncond_ratio": drop_mask.float().mean(),
+            },
             on_step=True,
             on_epoch=True,
             prog_bar=True,
-            batch_size=x.size(0),
+            batch_size=b,
         )
         return loss
 
-    def validation_step(self, batch, batch_idx):
-        x, tokens = batch
-        loss = self._forward_loss(x, tokens)
-        self.log(
-            "val/loss",
-            loss,
-            on_step=False,
-            on_epoch=True,
-            prog_bar=True,
-            batch_size=x.size(0),
+    def validation_step(self, batch, batch_idx: int):
+        x = self._pick_x_from_batch(batch).to(self.device)
+        ctx_raw = self._pick_context_from_batch(batch)
+
+        if "cell_params" not in batch:
+            raise RuntimeError("Batch nie zawiera 'cell_params', nie mam targetu dla y (val).")
+        
+        cell = batch["cell_params"].to(self.device)
+        with torch.no_grad():
+            z = self._encode_to_latents(x)
+
+        b = z.size(0)
+        t = torch.randint(0, self.sampler.T, (b,), device=self.device, dtype=torch.long)
+        eps = torch.randn_like(z)
+
+        alpha_bar = self.sampler.alphas_bar.to(self.device)[t].view(
+            b, *([1] * (z.dim() - 1))
         )
+        z_noisy = torch.sqrt(alpha_bar) * z + torch.sqrt(1.0 - alpha_bar) * eps
 
-        # sampling podglądu TYLKO na pierwszej paczce epoki
-        if (
-            self.current_epoch + 1
-        ) % self.cfg.sample_every_n_epochs == 0 and batch_idx == 0:
-            self._do_val_sampling(tokens[: self.cfg.sample_bs])
+        ctx_emb = self._encode_context(ctx_raw)
+
+        t_emb = timestep_embedding(t, self.hparams.time_dim).to(self.device)
+        eps_pred, y = self.model(z_noisy, ctx_emb, t_emb)
+
+        loss = SD_loss(eps_pred, eps, y, cell)
+        self.log("val/loss", loss, on_epoch=True, prog_bar=True, batch_size=b)
         return loss
-
-    def _load_vae_weights(self):
-        if not self.cfg.vae_weights:
-            self.print("[Diff] pomijam ładowanie VAE (brak ścieżki).")
-            return
-        ckpt = torch.load(self.cfg.vae_weights, map_location=self.device)
-        enc_sd = ckpt.get("encoder")
-        dec_sd = ckpt.get("decoder")
-        if enc_sd is None or dec_sd is None:
-            raise RuntimeError(
-                f"[Diff] plik {self.cfg.vae_weights} nie zawiera kluczy 'encoder'/'decoder'."
-            )
-
-        missing, unexpected = self.encoder.load_state_dict(enc_sd, strict=False)
-        if missing:
-            self.print(
-                f"[Diff][enc] missing: {missing[:6]}{'...' if len(missing) > 6 else ''}"
-            )
-        if unexpected:
-            self.print(
-                f"[Diff][enc] unexpected: {unexpected[:6]}{'...' if len(unexpected) > 6 else ''}"
-            )
-
-        missing, unexpected = self.decoder.load_state_dict(dec_sd, strict=False)
-        if missing:
-            self.print(
-                f"[Diff][dec] missing: {missing[:6]}{'...' if len(missing) > 6 else ''}"
-            )
-        if unexpected:
-            self.print(
-                f"[Diff][dec] unexpected: {unexpected[:6]}{'...' if len(unexpected) > 6 else ''}"
-            )
-
-        if "decoder_scale" in ckpt:
-            try:
-                self.decoder.scale = float(ckpt["decoder_scale"])
-                self.print(f"[Diff] ustawiono decoder.scale = {self.decoder.scale}")
-            except Exception:
-                pass
-
-        if self.cfg.freeze_vae:
-            for p in self.encoder.parameters():
-                p.requires_grad = False
-            for p in self.decoder.parameters():
-                p.requires_grad = False
-            self.encoder.eval()
-            self.decoder.eval()
-            self.print("[Diff] VAE załadowany i zamrożony.")
 
     @torch.no_grad()
-    def _do_val_sampling(self, tokens: torch.Tensor):
-        self.diffusion.eval()
-        self.encoder.eval()
+    def sample(
+        self,
+        batch_size: int,
+        latent_shape_hwz: Tuple[int, ...],
+        ctx_raw: torch.Tensor | None = None,
+        ctx_raw_uncond: torch.Tensor | None = None,
+        guidance_scale: float | None = None,
+    ) -> torch.Tensor:
+        device = self.device
+        Cz = getattr(self.vae.encoder, "latent_size", None)
+        if Cz is None:
+            Cz = getattr(self.hparams, "latent_channels", None)
+        if Cz is None:
+            Cz = getattr(
+                getattr(self, "vae", object), "cfg", VAEConfig()
+            ).latent_channels
 
-        sampler = DDPMSampler(
-            num_training_steps=self.cfg.T,
-            schedule=self.cfg.beta_schedule,
-            beta_start=float(self.betas[0].item()),
-            beta_end=float(self.betas[-1].item()),
-        )
-        sampler.set_device(self.device)
+        z_shape = (batch_size, Cz, *latent_shape_hwz)
 
-        B = tokens.size(0)
-        if self.cfg.use_clip:
-            context = self.clip(tokens)
+        cond_ctx = self._encode_context(ctx_raw) if ctx_raw is not None else None
+
+        if ctx_raw_uncond is not None:
+            uncond_ctx = self._encode_context(ctx_raw_uncond)
         else:
-            context = torch.zeros(B, 1, self.cfg.context_dim, device=self.device)
-
-        D = self.cfg.sample_size
-        latent_shape = (B, 4, D // 8, D // 8, D // 8)
-
-        z0 = sampler.sample(
-            model=self.diffusion,
-            context=context,
-            latent_shape=latent_shape,
-            device=self.device,
-            time_dim=self.cfg.time_dim,
-            generator=torch.Generator(device=self.device).manual_seed(0),
-            guidance_scale=self.cfg.guidance_scale,
-            uncond_context=None,
-            return_all=False,
-        )
-
-        x_hat = self.decoder(z0 / max(self.cfg.latent_scale, 1e-8))
-        if _HAS_TV:
-            mid = D // 2
-            slice_img = (x_hat[:, :, mid].clamp(-1, 1) + 1) / 2.0
-            save_path = os.path.join(
-                self.cfg.outdir, f"sample_ep{self.current_epoch:03d}.png"
+            uncond_ctx = self.null_context.expand(
+                batch_size, 1, self.hparams.context_dim
             )
-            save_image(slice_img, save_path)
-            self.print(f"[sample] zapisano podgląd: {save_path}")
-        else:
-            self.print("[sample] torchvision nieobecny – pomijam zapis PNG.")
+
+        g = self.hparams.guidance_scale if guidance_scale is None else guidance_scale
+
+        latents = self.sampler.sample(
+            model=self.model,
+            context=cond_ctx if cond_ctx is not None else uncond_ctx,
+            latent_shape=z_shape,
+            device=device,
+            time_dim=self.hparams.time_dim,
+            guidance_scale=g,
+            uncond_context=uncond_ctx if cond_ctx is not None else None,
+        )
+
+        scale = getattr(self.vae.decoder, "scale", 1.0)
+        x = self.vae.decoder(latents * scale)
+        return x
 
     def configure_optimizers(self):
-        learnable = list(self.diffusion.parameters()) + list(self.encoder.parameters())
-        opt = torch.optim.AdamW(
-            learnable, lr=self.cfg.lr, weight_decay=self.cfg.weight_decay
+        return torch.optim.AdamW(
+            list(self.model.parameters()) + list(self.ctx_enc.parameters()),
+            lr=self.hparams.lr,
+            weight_decay=self.hparams.weight_decay,
         )
 
-        if self.cfg.warmup_steps and self.cfg.warmup_steps > 0:
+    def on_fit_start(self):
+        if hasattr(self.sampler, "set_device"):
+            self.sampler.set_device(self.device)
 
-            def lr_lambda(step):
-                if step < self.cfg.warmup_steps:
-                    return float(step + 1) / float(self.cfg.warmup_steps)
-                return 1.0
+    def save(
+        self,
+        path: Union[str, Path],
+        *,
+        save_vae: bool = False,
+        vae_path_hint: Optional[Union[str, Path]] = None,
+        extra: Optional[dict] = None,
+    ) -> Path:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
 
-            sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lr_lambda)
-            return {
-                "optimizer": opt,
-                "lr_scheduler": {
-                    "scheduler": sched,
-                    "interval": "step",
-                    "name": "warmup",
-                },
+        payload = {
+            "format": "stable_diffusion_4d_pt1",
+            "hparams": dict(self.hparams),
+            "state_dicts": {
+                "ctx_enc": self.ctx_enc.state_dict(),
+                "diffusion": self.model.state_dict(),
+                "null_context": self.null_context.detach().cpu(),
+            },
+            "vae": None,
+            "vae_path_hint": str(vae_path_hint) if vae_path_hint is not None else None,
+            "extra": extra or {},
+        }
+
+        if save_vae:
+            payload["vae"] = {
+                "encoder": self.vae.encoder.state_dict(),
+                "decoder": self.vae.decoder.state_dict(),
+                "decoder_scale": getattr(self.vae.decoder, "scale", 1.0),
             }
-        return opt
+
+        torch.save(payload, path)
+        return path
+
+    @classmethod
+    def load(
+        cls,
+        ckpt_path: Union[str, Path],
+        *,
+        map_location: Union[str, torch.device] = "cpu",
+        vae_path: Optional[Union[str, Path]] = None,
+        strict: bool = True,
+        override_hparams: Optional[dict] = None,
+    ) -> "StableDiffusion":
+        ckpt_path = Path(ckpt_path)
+        blob = torch.load(ckpt_path, map_location=map_location)
+
+        if blob.get("format") != "stable_diffusion_4d_pt1":
+            raise ValueError("Nieznany format checkpointu (expected stable_diffusion_4d_pt1)")
+
+        hp = blob["hparams"] or {}
+        if override_hparams:
+            hp.update(override_hparams)
+
+        has_vae_weights = blob.get("vae") is not None
+        vae_path_hint = blob.get("vae_path_hint", None)
+        chosen_vae_path = vae_path or vae_path_hint
+
+        if not has_vae_weights and chosen_vae_path is None:
+            raise ValueError(
+                "Checkpoint nie zawiera wag VAE i nie podano `vae_path`. "
+                "Podaj ścieżkę do VAE lub zapisz checkpoint z `save_vae=True`."
+            )
+
+        sd = cls(
+            vae_path=chosen_vae_path if chosen_vae_path is not None else "",
+            time_dim=hp.get("time_dim", 320),
+            context_dim=hp.get("context_dim", 128),
+            lr=hp.get("lr", 1e-4),
+            weight_decay=hp.get("weight_decay", 1e-4),
+            num_train_steps=hp.get("num_train_steps", 1000),
+            p_uncond=hp.get("p_uncond", 0.1),
+            guidance_scale=hp.get("guidance_scale", 1.0),
+            ctx_encoder_kwargs=hp.get("ctx_encoder_kwargs", {}),
+        )
+        sd.to(map_location)
+
+        sd.model.load_state_dict(blob["state_dicts"]["diffusion"], strict=strict)
+        sd.ctx_enc.load_state_dict(blob["state_dicts"]["ctx_enc"], strict=strict)
+        null_ctx = blob["state_dicts"].get("null_context", None)
+        if null_ctx is not None:
+            with torch.no_grad():
+                sd.null_context.copy_(null_ctx.to(map_location))
+
+        if has_vae_weights:
+            vae_pack = blob["vae"]
+            sd.vae.encoder.load_state_dict(vae_pack["encoder"], strict=True)
+            sd.vae.decoder.load_state_dict(vae_pack["decoder"], strict=True)
+            if "decoder_scale" in vae_pack and hasattr(sd.vae.decoder, "scale"):
+                sd.vae.decoder.scale = vae_pack["decoder_scale"]
+            for p in sd.vae.parameters():
+                p.requires_grad = False
+            sd.vae.eval()
+        else:
+            pass
+
+        return sd
+
+    @torch.no_grad()
+    def generate_unimat_and_cell(
+        self,
+        batch_size: int,
+        latent_shape_hwz: Tuple[int, ...],
+        ctx_raw: torch.Tensor | None = None,
+        ctx_raw_uncond: torch.Tensor | None = None,
+        guidance_scale: float | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        x = self.sample(
+            batch_size=batch_size,
+            latent_shape_hwz=latent_shape_hwz,
+            ctx_raw=ctx_raw,
+            ctx_raw_uncond=ctx_raw_uncond,
+            guidance_scale=guidance_scale,
+        )
+
+        z = self._encode_to_latents(x)
+        b = z.size(0)
+        device = self.device
+
+        t = torch.zeros(b, dtype=torch.long, device=device)
+        t_emb = timestep_embedding(t, self.hparams.time_dim).to(device)
+
+        ctx_emb = self._encode_context(ctx_raw)
+
+        eps_pred, y_pred = self.model(z, ctx_emb, t_emb)
+
+        grid = x.permute(0, 2, 3, 4, 1).contiguous()
+
+        return grid, y_pred

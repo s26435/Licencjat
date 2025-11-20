@@ -150,11 +150,11 @@ class DDPMSampler:
                 c_in = torch.cat([uncond_context, context], dim=0)
                 t_in = torch.cat([t_emb, t_emb], dim=0)
 
-                eps = model(x_in, c_in, t_in)
+                eps, _ = model(x_in, c_in, t_in)
                 eps_uncond, eps_cond = eps.chunk(2, dim=0)
                 eps_pred = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
             else:
-                eps_pred = model(x, context, t_emb)
+                eps_pred, _ = model(x, context, t_emb)
 
             x = self.step(eps_pred, t, x, generator=generator)
 
