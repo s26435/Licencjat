@@ -4,5 +4,5 @@ from src.generate import main as generate_main
 
 if __name__ == "__main__":
     all_in_one()
-    train_full_workflow(ds_path="./data/unimat/torch", vae_epochs=1, sd_epochs=1)
-    generate_main()
+    # train_full_workflow(ds_path="./data/unimat/torch", vae_epochs=1, sd_epochs=1)
+    # generate_main()

@@ -1,9 +1,11 @@
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any 
+from typing import Dict, List, Tuple, Optional, Any
 import json
 import warnings
 import dotenv
 from datetime import datetime
+
+from joblib import Parallel, delayed
 
 import numpy as np
 import pandas as pd
@@ -44,6 +46,82 @@ warnings.filterwarnings("ignore", "", FutureWarning)
 dotenv.load_dotenv()
 
 
+def _fetch_bs_and_cif_for_mpid(
+    mpid: str,
+    cif_out: Path,
+) -> Optional[pd.DataFrame]:
+    try:
+        cif_path = cif_out / f"{mpid}.cif"
+        with MPRester() as mpr:
+            df_one = _get_bs_rows(mpr, mpid)
+            if not cif_path.exists():
+                try:
+                    _download_cif_by_id(mpr, mpid, cif_out)
+                except Exception as e:
+                    print(f"[WARN] CIF {mpid}: {e}")
+            return df_one
+    except Exception as e:
+        print(f"[WARN] BS {mpid}: {e}")
+        return None
+
+
+def _build_single_sample(
+    mpid: str,
+    cif_path: Path,
+    by_mpid: Dict[str, pd.DataFrame],
+    label_vocab: List[str],
+    samp_dir: Path,
+    meta_dir: Path,
+    max_atoms_per_element: int,
+) -> Optional[str]:
+    try:
+        npz_path = samp_dir / f"{mpid}.npz"
+        if npz_path.exists():
+            return mpid
+
+        s = _read_cif_as_structure(
+            cif_path, force_primitive=True, symprec=1e-2, angle_tol=5.0
+        )
+        atoms, cell = _structure_to_atoms_and_cell(s)
+        grid, _ = _build_unimat_grid(atoms, max_atoms_per_element=max_atoms_per_element)
+        cell_vec = np.array(
+            [
+                cell["a"],
+                cell["b"],
+                cell["c"],
+                cell["alpha"],
+                cell["beta"],
+                cell["gamma"],
+            ],
+            dtype=np.float32,
+        )
+
+        ctx = np.full((len(label_vocab), 3), np.nan, dtype=np.float32)
+        if mpid in by_mpid:
+            sub = by_mpid[mpid][["label", "ev"]].dropna(subset=["label"])
+            sub = sub.groupby("label", as_index=False).first()
+            val_map = {
+                row["label"]: _parse_ev_triplet(row["ev"]) for _, row in sub.iterrows()
+            }
+            for i_lab, lab in enumerate(label_vocab):
+                if lab in val_map:
+                    ctx[i_lab, :] = val_map[lab]
+
+        np.savez_compressed(
+            samp_dir / f"{mpid}.npz", grid=grid, cell_params=cell_vec, context=ctx
+        )
+
+        formula = s.composition.reduced_formula
+        density = s.density
+        meta_text = f"material_id={mpid}\nformula={formula}\ndensity={density:.6f}\n"
+        (meta_dir / f"{mpid}.txt").write_text(meta_text, encoding="utf-8")
+        return mpid
+
+    except Exception as e:
+        print(f"[WARN] BUILD {mpid}: {e}")
+        return None
+
+
 def _download_cif_by_id(
     mpr: MPRester,
     mpid: str,
@@ -54,28 +132,20 @@ def _download_cif_by_id(
 ):
     raw = mpr.get_structure_by_material_id(mpid)
     structure = _ensure_structure(raw)
-    sga = SpacegroupAnalyzer(structure, symprec=symprec, angle_tolerance=angle_tol)
-    prim = sga.get_primitive_standard_structure() if force_primitive else structure
-    if prim is None or prim.num_sites >= structure.num_sites:
-        prim = structure
+    if force_primitive:
+        sga = SpacegroupAnalyzer(structure, symprec=symprec, angle_tolerance=angle_tol)
+        prim = sga.get_primitive_standard_structure()
+        if prim is not None and prim.num_sites < structure.num_sites:
+            structure = prim
     folder.mkdir(parents=True, exist_ok=True)
     out_path = folder / f"{mpid}.cif"
-    CifWriter(prim, symprec=symprec).write_file(out_path)
+    CifWriter(structure, symprec=symprec).write_file(out_path)
 
 
 def _read_cif_as_structure(
     cif_path: Path,
-    force_primitive: bool = True,
-    symprec: float = 1e-2,
-    angle_tol: float = 5.0,
 ) -> Structure:
-    s = Structure.from_file(str(cif_path))
-    if force_primitive:
-        sga = SpacegroupAnalyzer(s, symprec=symprec, angle_tolerance=angle_tol)
-        prim = sga.get_primitive_standard_structure()
-        if prim is not None and prim.num_sites <= s.num_sites:
-            return prim
-    return s
+    return Structure.from_file(str(cif_path))
 
 
 def _structure_to_atoms_and_cell(
@@ -145,6 +215,7 @@ class UniMatTorchDataset(Dataset):
             context = torch.from_numpy(data["context"]).float()  # [L,3]
         return {"id": mpid, "grid": grid, "cell_params": cell, "context": context}
 
+
 def _to_ch_first(grid: torch.Tensor) -> torch.Tensor:
     if grid.dim() != 4 or grid.size(-1) != 3:
         raise ValueError(f"grid expected shape [P,G,K,3], got {tuple(grid.shape)}")
@@ -164,6 +235,7 @@ def _pad_context(batch_ctx: List[torch.Tensor]) -> Tuple[torch.Tensor, torch.Ten
         ctx_padded[i, :L] = c
         mask[i, :L] = True
     return ctx_padded, mask
+
 
 class GridCtxDataModule(pl.LightningDataModule):
     def __init__(
@@ -204,14 +276,16 @@ class GridCtxDataModule(pl.LightningDataModule):
         n_val = int(round((n - n_test) * self.val_split))
         n_train = n - n_val - n_test
         g = torch.Generator().manual_seed(self.seed)
-        self.ds_train, self.ds_val, self.ds_test = random_split(self.ds_full, [n_train, n_val, n_test], generator=g)
+        self.ds_train, self.ds_val, self.ds_test = random_split(
+            self.ds_full, [n_train, n_val, n_test], generator=g
+        )
 
     def _collate_with_context(self, samples: List[Dict[str, Any]]) -> Dict[str, Any]:
         ids = [s["id"] for s in samples]
-        x = torch.stack([_to_ch_first(s["grid"]) for s in samples], dim=0)      # [B, 3, P, G, K]
-        cell = torch.stack([s["cell_params"] for s in samples], dim=0)          # [B, 6]
-        ctx_list = [s["context"] for s in samples]                               # L_i x 3
-        ctx_padded, mask = _pad_context(ctx_list)                                # [B, Lmax, 3], [B, Lmax]
+        x = torch.stack([_to_ch_first(s["grid"]) for s in samples], dim=0)
+        cell = torch.stack([s["cell_params"] for s in samples], dim=0)
+        ctx_list = [s["context"] for s in samples]
+        ctx_padded, mask = _pad_context(ctx_list)
         batch = {"id": ids, "x": x, "cell_params": cell, "context": ctx_padded}
         if self.return_ctx_mask:
             batch["context_mask"] = mask
@@ -219,9 +293,13 @@ class GridCtxDataModule(pl.LightningDataModule):
 
     def train_dataloader(self):
         return DataLoader(
-            self.ds_train, batch_size=self.batch_size, shuffle=True,
-            num_workers=self.num_workers, pin_memory=self.pin_memory,
-            persistent_workers=self.persistent_workers, drop_last=self.drop_last,
+            self.ds_train,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            persistent_workers=self.persistent_workers,
+            drop_last=self.drop_last,
             collate_fn=self._collate_with_context,
         )
 
@@ -229,9 +307,13 @@ class GridCtxDataModule(pl.LightningDataModule):
         if len(self.ds_val) == 0:
             return None
         return DataLoader(
-            self.ds_val, batch_size=self.batch_size, shuffle=False,
-            num_workers=self.num_workers, pin_memory=self.pin_memory,
-            persistent_workers=self.persistent_workers, drop_last=False,
+            self.ds_val,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            persistent_workers=self.persistent_workers,
+            drop_last=False,
             collate_fn=self._collate_with_context,
         )
 
@@ -239,19 +321,24 @@ class GridCtxDataModule(pl.LightningDataModule):
         if len(self.ds_test) == 0:
             return None
         return DataLoader(
-            self.ds_test, batch_size=self.batch_size, shuffle=False,
-            num_workers=self.num_workers, pin_memory=self.pin_memory,
-            persistent_workers=self.persistent_workers, drop_last=False,
+            self.ds_test,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            persistent_workers=self.persistent_workers,
+            drop_last=False,
             collate_fn=self._collate_with_context,
         )
 
 
 def _collate_fixed(batch: List[Dict[str, torch.Tensor]]):
     ids = [b["id"] for b in batch]
-    grid = torch.stack([b["grid"] for b in batch], 0)  # [B,P,G,K,3]
-    cell = torch.stack([b["cell_params"] for b in batch], 0)  # [B,6]
-    ctx = torch.stack([b["context"] for b in batch], 0)  # [B,L,3]
+    grid = torch.stack([b["grid"] for b in batch], 0)
+    cell = torch.stack([b["cell_params"] for b in batch], 0)
+    ctx = torch.stack([b["context"] for b in batch], 0)
     return {"id": ids, "grid": grid, "cell_params": cell, "context": ctx}
+
 
 def all_in_one(
     main_ds_dir: str = MAIN_DS_DIR,
@@ -260,6 +347,8 @@ def all_in_one(
     torch_out: str = TORCH_OUT,
     limit: Optional[int] = LIMIT,
     max_atoms_per_element: int = MAX_ATOMS_PER_ELEMENT,
+    n_jobs_fetch: int = 1,
+    n_jobs_build: int = 4,
 ):
     start = datetime.now()
     cif_out = _ensure_dir(Path(main_ds_dir) / cif_subdir)
@@ -272,25 +361,36 @@ def all_in_one(
             "ev": pd.Series(dtype="object"),
         }
     )
+
     with MPRester() as mpr:
         docs = mpr.materials.summary.search(
             has_props=[HasProps.bandstructure], fields=["material_id"]
         )
         mpids = [str(doc.material_id) for doc in docs]
-        total = limit if limit is not None else len(mpids)
+
+    if limit is not None:
+        mpids = mpids[:limit]
+    total = len(mpids)
+    print(f"Łącznie mpidów do pobrania: {total}")
+
+    if n_jobs_fetch == 1:
+        dfs = []
         for i, mpid in enumerate(mpids, start=1):
-            if limit is not None and i > limit:
-                break
             print(f"[{i}/{total}] {mpid}")
-            try:
-                df_one = _get_bs_rows(mpr, mpid)
-                whole = pd.concat([whole, df_one], axis=0, ignore_index=True)
-            except Exception as e:
-                print(f"[WARN] BS {mpid}: {e}")
-            try:
-                _download_cif_by_id(mpr, mpid, cif_out)
-            except Exception as e:
-                print(f"[WARN] CIF {mpid}: {e}")
+            df_one = _fetch_bs_and_cif_for_mpid(mpid, cif_out)
+            if df_one is not None:
+                dfs.append(df_one)
+    else:
+        dfs = Parallel(n_jobs=n_jobs_fetch)(
+            delayed(_fetch_bs_and_cif_for_mpid)(mpid, cif_out) for mpid in mpids
+        )
+        dfs = [d for d in dfs if d is not None]
+
+    if len(dfs) == 0:
+        print("[ERROR] Nie udało się pobrać żadnych band structures.")
+        return
+
+    whole = pd.concat(dfs, axis=0, ignore_index=True)
 
     whole["label"] = whole["label"].map(normalize_label_file_only)
     csv_out = Path(main_ds_dir) / csv_name
@@ -306,56 +406,41 @@ def all_in_one(
 
     cif_paths = sorted([p for p in cif_out.glob("*.cif") if p.is_file()])
     ids: List[str] = [p.stem for p in cif_paths]
-    saved: List[str] = []
 
-    for mpid, path in zip(ids, cif_paths):
-        try:
-            s = _read_cif_as_structure(
-                path, force_primitive=True, symprec=1e-2, angle_tol=5.0
+    print(f"Liczba CIF-ów do przetworzenia: {len(ids)}")
+
+    if n_jobs_build == 1:
+        saved: List[str] = []
+        for mpid, path in zip(ids, cif_paths):
+            res = _build_single_sample(
+                mpid,
+                path,
+                by_mpid,
+                label_vocab,
+                samp_dir,
+                meta_dir,
+                max_atoms_per_element,
             )
-            atoms, cell = _structure_to_atoms_and_cell(s)
-            grid, _ = _build_unimat_grid(
-                atoms, max_atoms_per_element=max_atoms_per_element
+            if res is not None:
+                saved.append(res)
+    else:
+        results = Parallel(
+            n_jobs=n_jobs_build,
+            batch_size=8,
+            prefer="processes",
+        )(
+            delayed(_build_single_sample)(
+                mpid,
+                path,
+                by_mpid,
+                label_vocab,
+                samp_dir,
+                meta_dir,
+                max_atoms_per_element,
             )
-            cell_vec = np.array(
-                [
-                    cell["a"],
-                    cell["b"],
-                    cell["c"],
-                    cell["alpha"],
-                    cell["beta"],
-                    cell["gamma"],
-                ],
-                dtype=np.float32,
-            )
-
-            ctx = np.full((len(label_vocab), 3), np.nan, dtype=np.float32)
-            if mpid in by_mpid:
-                sub = by_mpid[mpid][["label", "ev"]].dropna(subset=["label"])
-                sub = sub.groupby("label", as_index=False).first()
-                val_map = {
-                    row["label"]: _parse_ev_triplet(row["ev"])
-                    for _, row in sub.iterrows()
-                }
-                for i_lab, lab in enumerate(label_vocab):
-                    if lab in val_map:
-                        ctx[i_lab, :] = val_map[lab]
-
-            np.savez_compressed(
-                samp_dir / f"{mpid}.npz", grid=grid, cell_params=cell_vec, context=ctx
-            )
-
-            formula = s.composition.reduced_formula
-            density = s.density
-            sg = SpacegroupAnalyzer(
-                s, symprec=1e-2, angle_tolerance=5.0
-            ).get_space_group_symbol()
-            meta_text = f"material_id={mpid}\nformula={formula}\ndensity={density:.6f}\nspacegroup={sg}"
-            (meta_dir / f"{mpid}.txt").write_text(meta_text, encoding="utf-8")
-
-            saved.append(mpid)
-        except Exception as e:
-            print(f"[WARN] BUILD {mpid}: {e}")
+            for mpid, path in zip(ids, cif_paths)
+        )
+        saved = [r for r in results if r is not None]
 
     (out_root / "index.json").write_text(
         json.dumps(
@@ -405,4 +490,4 @@ def all_in_one(
 
 
 if __name__ == "__main__":
-    all_in_one()
+    all_in_one(n_jobs_build=4, n_jobs_fetch=4)
